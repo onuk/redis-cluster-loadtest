@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Redis Stress Test — auto-detect Cluster / Standalone
-Password-based authentication (AUTH)
+Redis Stress Tester — standalone-replication aware
+Supports: single node, cluster, or multi-node replication (1 master + N replicas).
+Authentication via password (AUTH).
 Copyright (c) 2026 Yurii Onuk
 Licensed under MIT License
 """
@@ -14,7 +15,7 @@ import sys
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 try:
     import redis
@@ -37,6 +38,7 @@ try:
 except ImportError:
     HAS_TABULATE = False
 
+
 # ─────────────────────────────────────────────────────────────
 # Colors
 # ─────────────────────────────────────────────────────────────
@@ -45,66 +47,49 @@ class C:
     GREEN  = "\033[92m"
     YELLOW = "\033[93m"
     CYAN   = "\033[96m"
+    MAGENTA= "\033[95m"
     BOLD   = "\033[1m"
     RESET  = "\033[0m"
 
-def ok(msg):   print(f"{C.GREEN}✔ {msg}{C.RESET}")
-def err(msg):  print(f"{C.RED}✘ {msg}{C.RESET}")
-def info(msg): print(f"{C.CYAN}ℹ {msg}{C.RESET}")
-def warn(msg): print(f"{C.YELLOW}⚠ {msg}{C.RESET}")
-def bold(msg): print(f"{C.BOLD}{msg}{C.RESET}")
+def ok(msg):    print(f"{C.GREEN}✔ {msg}{C.RESET}")
+def err(msg):   print(f"{C.RED}✘ {msg}{C.RESET}")
+def info(msg):  print(f"{C.CYAN}ℹ {msg}{C.RESET}")
+def warn(msg):  print(f"{C.YELLOW}⚠ {msg}{C.RESET}")
+def bold(msg):  print(f"{C.BOLD}{msg}{C.RESET}")
+def head(msg):  print(f"{C.MAGENTA}{C.BOLD}{msg}{C.RESET}")
 
 
 # ─────────────────────────────────────────────────────────────
-# Auto-detect: cluster or standalone?
+# Node descriptor
 # ─────────────────────────────────────────────────────────────
-def detect_mode(host: str, port: int, password: Optional[str],
-                use_ssl: bool) -> str:
-    """
-    Connects with a plain redis.Redis client and queries INFO server.
-    Returns 'cluster' or 'standalone'.
-    """
-    try:
-        c = redis.Redis(
-            host=host, port=port, password=password,
-            ssl=use_ssl, socket_timeout=5, decode_responses=True,
-        )
-        mode = c.info("server").get("redis_mode", "standalone")
-        c.close()
-        return mode  # 'cluster' or 'standalone'
-    except Exception:
-        return "standalone"
+@dataclass
+class NodeInfo:
+    host: str
+    port: int
+    role: str = "unknown"        # 'master' | 'slave' | 'unknown'
+    redis_version: str = "?"
+    os: str = "?"
+    uptime_days: int = 0
+    memory_mb: int = 0
+    master_host: str = ""
+    master_port: str = ""
+    reachable: bool = False
 
+    @property
+    def addr(self) -> str:
+        return f"{self.host}:{self.port}"
 
-# ─────────────────────────────────────────────────────────────
-# Client factory
-# ─────────────────────────────────────────────────────────────
-def create_client(host: str, port: int, password: Optional[str],
-                  use_ssl: bool, is_cluster: bool, timeout: float = 5.0):
-    if is_cluster:
-        kwargs = dict(
-            startup_nodes=[ClusterNode(host=host, port=port)],
-            password=password or None,
-            socket_timeout=timeout,
-            socket_connect_timeout=timeout,
-            ssl=use_ssl,
-            decode_responses=True,
-            skip_full_coverage_check=True,
-        )
-        # read_from_replicas deprecated in redis-py >= 5.3
-        if REDIS_VERSION < (5, 3):
-            kwargs["read_from_replicas"] = False
-        return RedisCluster(**kwargs)
+    @property
+    def is_replica(self) -> bool:
+        return self.role == "slave"
 
-    return redis.Redis(
-        host=host,
-        port=port,
-        password=password or None,
-        socket_timeout=timeout,
-        socket_connect_timeout=timeout,
-        ssl=use_ssl,
-        decode_responses=True,
-    )
+    @property
+    def label(self) -> str:
+        role_str = {
+            "master": f"{C.GREEN}MASTER{C.RESET}",
+            "slave":  f"{C.YELLOW}REPLICA{C.RESET}",
+        }.get(self.role, f"{C.RED}UNKNOWN{C.RESET}")
+        return f"{self.addr} [{role_str}]"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -113,6 +98,7 @@ def create_client(host: str, port: int, password: Optional[str],
 @dataclass
 class TestResult:
     test_name: str
+    node: str = ""
     total_ops: int = 0
     success: int = 0
     failed: int = 0
@@ -155,188 +141,244 @@ class TestResult:
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 1: Connectivity check
+# Parse host list  "host:port,host:port,..."
 # ─────────────────────────────────────────────────────────────
-def test_connectivity(host, port, password, use_ssl, is_cluster) -> tuple:
-    """Returns (success: bool, is_replica: bool)."""
-    bold("\n══════════════════════════════════════════")
-    bold(" STEP 1: Connectivity check")
-    bold("══════════════════════════════════════════")
-    try:
-        client = create_client(host, port, password, use_ssl, is_cluster)
-        pong = client.ping()
-        ok(f"PING → {pong}")
-
-        srv = client.info("server")
-        ok(f"Redis version : {srv.get('redis_version', '?')}")
-        ok(f"Mode          : {srv.get('redis_mode', 'standalone')}")
-        ok(f"OS            : {srv.get('os', '?')}")
-        ok(f"Uptime (days) : {srv.get('uptime_in_days', '?')}")
-
-        mem = client.info("memory")
-        ok(f"Memory used   : {int(mem.get('used_memory', 0)) // 1024 // 1024} MB")
-
-        # Replication role check
-        is_replica = False
-        try:
-            rep = client.info("replication")
-            role = rep.get("role", "master")
-            if role == "slave":
-                is_replica = True
-                warn(f"Role          : REPLICA (read-only!)")
-                warn(f"Master        : {rep.get('master_host','?')}:{rep.get('master_port','?')}")
-                warn("Write ops (SET/DEL) will use GET-only mode to avoid ReadOnlyError")
-            else:
-                ok(f"Role          : master (read-write)")
-        except Exception:
-            ok("Role          : master (assumed)")
-
-        if is_cluster:
-            try:
-                ci = client.cluster_info()
-                ok(f"Cluster state : {ci.get('cluster_state', '?')}")
-                ok(f"Known nodes   : {ci.get('cluster_known_nodes', '?')}")
-                ok(f"Slots assigned: {ci.get('cluster_slots_assigned', '?')}")
-            except Exception:
-                pass
-
-        client.close()
-        return True, is_replica
-    except AuthenticationError as e:
-        err(f"Authentication error: {e}")
-        warn("Check your --password")
-    except (RedisConnectionError, RedisClusterException) as e:
-        err(f"Connection error: {e}")
-    except Exception as e:
-        err(f"{type(e).__name__}: {e}")
-    return False, False
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 2: Max connections test
-# ─────────────────────────────────────────────────────────────
-def test_max_connections(host, port, password, use_ssl, is_cluster,
-                         max_conn: int, step: int) -> TestResult:
-    bold("\n══════════════════════════════════════════")
-    bold(" STEP 2: Max connections test")
-    bold("══════════════════════════════════════════")
-
-    result = TestResult("max_connections")
-    clients = []
-    lock = threading.Lock()
-
-    def open_conn(_):
-        try:
-            c = create_client(host, port, password, use_ssl, is_cluster, timeout=3.0)
-            c.ping()
-            with lock:
-                clients.append(c)
-            return True
-        except Exception as e:
-            n = type(e).__name__
-            with lock:
-                result.errors[n] = result.errors.get(n, 0) + 1
-            return False
-
-    info(f"Opening connections (step={step}, max={max_conn})…")
-    consecutive_failures = 0
-
-    while len(clients) < max_conn:
-        needed = min(step, max_conn - len(clients))
-        with ThreadPoolExecutor(max_workers=needed) as ex:
-            batch = [f.result() for f in as_completed(
-                [ex.submit(open_conn, i) for i in range(needed)]
-            )]
-
-        failed = batch.count(False)
-        print(f"  Open: {C.GREEN}{len(clients)}{C.RESET}  "
-              f"Failed: {C.RED}{failed}{C.RESET}        ", end="\r")
-
-        if failed > 0:
-            consecutive_failures += 1
-            if consecutive_failures >= 3 or failed == needed:
-                warn(f"\nConnection limit reached after {consecutive_failures} failed batches!")
-                break
+def parse_hosts(raw: str) -> List[tuple]:
+    """
+    Accepts:
+      - "host:port"
+      - "host:port,host:port,..."
+      - "host:port host:port ..." (space-separated)
+    Returns list of (host, port) tuples.
+    """
+    nodes = []
+    for token in raw.replace(",", " ").split():
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            h, p = token.rsplit(":", 1)
+            nodes.append((h.strip(), int(p.strip())))
         else:
-            consecutive_failures = 0
-
-    result.max_connections = len(clients)
-    ok(f"\nMax open connections: {C.BOLD}{result.max_connections}{C.RESET}")
-    # NOTE: connections are NOT closed here — they are passed to the
-    # load test so the OS does not hit TIME_WAIT on re-open.
-    result._pool = clients
-    return result
+            nodes.append((token, 6379))
+    return nodes
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3: Load test (SET / GET / DEL)
-# Each worker reuses a pre-opened persistent connection from the
-# shared pool, so min_conns sockets stay alive for the full test.
+# Client factory
 # ─────────────────────────────────────────────────────────────
-def _open_one_conn(args):
-    """Thread-pool target: open + ping one connection."""
+def make_client(host: str, port: int, password: Optional[str],
+                use_ssl: bool, is_cluster: bool, timeout: float = 5.0):
+    if is_cluster:
+        kwargs = dict(
+            startup_nodes=[ClusterNode(host=host, port=port)],
+            password=password or None,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
+            ssl=use_ssl,
+            decode_responses=True,
+            skip_full_coverage_check=True,
+        )
+        if REDIS_VERSION < (5, 3):
+            kwargs["read_from_replicas"] = False
+        return RedisCluster(**kwargs)
+
+    return redis.Redis(
+        host=host, port=port,
+        password=password or None,
+        socket_timeout=timeout,
+        socket_connect_timeout=timeout,
+        ssl=use_ssl,
+        decode_responses=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 1: Probe all nodes, detect topology
+# ─────────────────────────────────────────────────────────────
+def probe_node(host: str, port: int, password: Optional[str],
+               use_ssl: bool, is_cluster: bool) -> NodeInfo:
+    node = NodeInfo(host=host, port=port)
+    try:
+        c = make_client(host, port, password, use_ssl, is_cluster, timeout=5.0)
+        c.ping()
+
+        srv = c.info("server")
+        node.redis_version = srv.get("redis_version", "?")
+        node.os            = srv.get("os", "?")
+        node.uptime_days   = int(srv.get("uptime_in_days", 0))
+
+        mem = c.info("memory")
+        node.memory_mb = int(mem.get("used_memory", 0)) // 1024 // 1024
+
+        rep = c.info("replication")
+        node.role        = rep.get("role", "master")
+        node.master_host = rep.get("master_host", "")
+        node.master_port = str(rep.get("master_port", ""))
+
+        node.reachable = True
+        c.close()
+    except AuthenticationError as e:
+        err(f"  {host}:{port} — Authentication error: {e}")
+    except Exception as e:
+        err(f"  {host}:{port} — {type(e).__name__}: {e}")
+    return node
+
+
+def step_connectivity(nodes_raw: List[tuple], password, use_ssl, is_cluster) -> List[NodeInfo]:
+    bold("\n══════════════════════════════════════════")
+    bold(" STEP 1: Topology discovery")
+    bold("══════════════════════════════════════════")
+
+    nodes: List[NodeInfo] = []
+    for (host, port) in nodes_raw:
+        info(f"Probing {host}:{port} …")
+        n = probe_node(host, port, password, use_ssl, is_cluster)
+        nodes.append(n)
+        if n.reachable:
+            role_str = (f"{C.GREEN}MASTER{C.RESET}"  if n.role == "master"
+                   else f"{C.YELLOW}REPLICA{C.RESET}" if n.role == "slave"
+                   else n.role)
+            ok(f"  {host}:{port}  role={role_str}  "
+               f"redis={n.redis_version}  mem={n.memory_mb}MB  "
+               f"uptime={n.uptime_days}d")
+            if n.is_replica:
+                info(f"    └─ replicates from {n.master_host}:{n.master_port}")
+        else:
+            err(f"  {host}:{port}  UNREACHABLE")
+
+    masters  = [n for n in nodes if n.reachable and n.role == "master"]
+    replicas = [n for n in nodes if n.reachable and n.is_replica]
+    failed   = [n for n in nodes if not n.reachable]
+
+    bold("\n  Topology summary:")
+    ok(f"  Masters  : {len(masters)}  → " +
+       ", ".join(n.addr for n in masters) if masters else "  Masters  : 0")
+    ok(f"  Replicas : {len(replicas)}  → " +
+       ", ".join(n.addr for n in replicas)) if replicas else warn("  Replicas : 0")
+    if failed:
+        warn(f"  Failed   : {len(failed)}  → " + ", ".join(n.addr for n in failed))
+
+    reachable = [n for n in nodes if n.reachable]
+    if not reachable:
+        err("No reachable nodes — aborting.")
+        sys.exit(1)
+
+    return nodes
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2: Max connections test  (per node)
+# ─────────────────────────────────────────────────────────────
+def _open_one(args):
     host, port, password, use_ssl, is_cluster = args
     try:
-        c = create_client(host, port, password, use_ssl, is_cluster, timeout=5.0)
+        c = make_client(host, port, password, use_ssl, is_cluster, timeout=3.0)
         c.ping()
         return c
     except Exception as e:
         return e
 
 
-def build_connection_pool(host, port, password, use_ssl, is_cluster,
-                          target: int, step: int = 100):
-    """
-    Pre-open `target` persistent connections in parallel batches.
-    Returns the list of live clients (may be less than target if OS
-    limit is hit) and a dict of errors.
-    """
+def max_conn_for_node(node: NodeInfo, password, use_ssl, is_cluster,
+                      max_conn: int, step: int) -> TestResult:
+    result = TestResult("max_connections", node=node.addr)
     clients = []
-    errors = {}
+    errors  = {}
     consecutive_failures = 0
 
-    info(f"Pre-opening {target} persistent connections (batch={step})…")
-    while len(clients) < target:
-        needed = min(step, target - len(clients))
-        task_args = [(host, port, password, use_ssl, is_cluster)] * needed
+    while len(clients) < max_conn:
+        needed   = min(step, max_conn - len(clients))
+        task_args = [(node.host, node.port, password, use_ssl, is_cluster)] * needed
         with ThreadPoolExecutor(max_workers=needed) as ex:
-            results = list(ex.map(_open_one_conn, task_args))
+            batch = list(ex.map(_open_one, task_args))
 
-        ok_batch = [r for r in results if not isinstance(r, Exception)]
-        err_batch = [r for r in results if isinstance(r, Exception)]
+        ok_batch  = [r for r in batch if not isinstance(r, Exception)]
+        err_batch = [r for r in batch if isinstance(r, Exception)]
         clients.extend(ok_batch)
 
         for e in err_batch:
             n = type(e).__name__
             errors[n] = errors.get(n, 0) + 1
 
-        print(f"  Connections ready: {C.GREEN}{len(clients)}{C.RESET}  "
+        print(f"  [{node.addr}] Open: {C.GREEN}{len(clients)}{C.RESET}  "
               f"Failed: {C.RED}{len(err_batch)}{C.RESET}        ", end="\r")
 
         if err_batch:
             consecutive_failures += 1
             if consecutive_failures >= 3 or len(err_batch) == needed:
-                warn(f"\nOS connection limit hit at {len(clients)} — continuing with that many")
+                warn(f"\n  OS limit hit at {len(clients)} connections")
                 break
         else:
             consecutive_failures = 0
 
     print()
+    result.max_connections = len(clients)
+    result.errors          = errors
+    result._pool           = clients   # kept open for load test reuse
+    return result
+
+
+def step_max_connections(nodes: List[NodeInfo], password, use_ssl, is_cluster,
+                         max_conn: int, step: int) -> dict:
+    bold("\n══════════════════════════════════════════")
+    bold(" STEP 2: Max connections test  (per node)")
+    bold("══════════════════════════════════════════")
+
+    results = {}
+    for node in nodes:
+        if not node.reachable:
+            continue
+        info(f"\nTesting {node.label}  (target: {max_conn})…")
+        r = max_conn_for_node(node, password, use_ssl, is_cluster, max_conn, step)
+        ok(f"Max open connections: {C.BOLD}{r.max_connections}{C.RESET}")
+        results[node.addr] = r
+
+    # Close all pools — will be re-opened in load test
+    # (or pass them through if you want to avoid TIME_WAIT on the same run)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: Load test  (per node)
+# ─────────────────────────────────────────────────────────────
+def _build_pool(node: NodeInfo, password, use_ssl, is_cluster,
+                target: int, step: int = 100) -> tuple:
+    clients = []
+    errors  = {}
+    consecutive_failures = 0
+
+    info(f"  Pre-opening {target} connections to {node.addr}…")
+    while len(clients) < target:
+        needed = min(step, target - len(clients))
+        task_args = [(node.host, node.port, password, use_ssl, is_cluster)] * needed
+        with ThreadPoolExecutor(max_workers=needed) as ex:
+            batch = list(ex.map(_open_one, task_args))
+        ok_b  = [r for r in batch if not isinstance(r, Exception)]
+        err_b = [r for r in batch if isinstance(r, Exception)]
+        clients.extend(ok_b)
+        for e in err_b:
+            n = type(e).__name__
+            errors[n] = errors.get(n, 0) + 1
+        print(f"    Connections: {C.GREEN}{len(clients)}{C.RESET}  "
+              f"Failed: {C.RED}{len(err_b)}{C.RESET}        ", end="\r")
+        if err_b:
+            consecutive_failures += 1
+            if consecutive_failures >= 3 or len(err_b) == needed:
+                warn(f"\n    OS limit hit at {len(clients)}")
+                break
+        else:
+            consecutive_failures = 0
+    print()
     return clients, errors
 
 
-def run_worker(worker_id, client, ops_per_worker, key_prefix, rq,
-               is_replica: bool = False):
-    """
-    Worker that reuses an already-open connection from the pool.
-    If is_replica=True, only GET is used (replica nodes are read-only).
-    """
+def _worker(worker_id, client, ops, key_prefix, rq, is_replica: bool):
     lat, s, f, errs = [], 0, 0, {}
-    # Master: SET/GET/DEL cycle.  Replica: GET only.
     cycle = ["GET"] if is_replica else ["SET", "GET", "DEL"]
-    for i in range(ops_per_worker):
-        key = f"{key_prefix}:{worker_id}:{i % 100}"   # reuse 100 keys
-        op = cycle[i % len(cycle)]
+    for i in range(ops):
+        key = f"{key_prefix}:{worker_id}:{i % 100}"
+        op  = cycle[i % len(cycle)]
         try:
             t0 = time.perf_counter()
             if op == "SET":
@@ -354,65 +396,50 @@ def run_worker(worker_id, client, ops_per_worker, key_prefix, rq,
     rq.put((s, f, lat, errs))
 
 
-def test_load(host, port, password, use_ssl, is_cluster,
-              workers, ops_per_worker, min_conns: int = 1000,
-              reuse_pool: list = None, is_replica: bool = False) -> TestResult:
-    bold("\n══════════════════════════════════════════")
-    op_desc = "GET-only (replica)" if is_replica else "SET/GET/DEL"
-    bold(f" STEP 3: Load test ({op_desc})")
-    bold("══════════════════════════════════════════")
+def load_test_node(node: NodeInfo, password, use_ssl, is_cluster,
+                   workers: int, ops_per_worker: int,
+                   min_conns: int, reuse_pool=None) -> TestResult:
 
+    op_label = "GET-only (replica)" if node.is_replica else "SET/GET/DEL"
+    info(f"\n  Node: {node.label}  [{op_label}]")
+    info(f"  Workers: {workers}  Ops/worker: {ops_per_worker}  "
+         f"Total: {workers * ops_per_worker}")
+
+    result  = TestResult("load_test", node=node.addr)
     pool_target = max(workers, min_conns)
-    info(f"Workers: {workers}  |  Ops/worker: {ops_per_worker}  "
-         f"|  Total ops: {workers * ops_per_worker}")
-    info(f"Min persistent connections: {min_conns}  (pool target: {pool_target})")
+    owned_pool  = False
 
-    result = TestResult("load_test")
-    pool_errors = {}
-    owned_pool = False  # whether we opened the pool ourselves
-
-    # ── Phase 1: get connection pool ──────────────────────────
     if reuse_pool and len(reuse_pool) >= min_conns:
-        # Reuse connections left open by step 2 — avoids TIME_WAIT
         pool = reuse_pool[:pool_target]
-        ok(f"Reusing {len(pool)} connections from Step 2 (no TIME_WAIT!)")
+        ok(f"  Reusing {len(pool)} connections from Step 2")
     else:
-        # Open fresh pool (step 2 was skipped or pool is too small)
         owned_pool = True
-        pool, pool_errors = build_connection_pool(
-            host, port, password, use_ssl, is_cluster,
-            target=pool_target, step=100,
-        )
+        pool, pool_errs = _build_pool(node, password, use_ssl, is_cluster,
+                                      pool_target, step=100)
+        for k, v in pool_errs.items():
+            result.errors[k] = result.errors.get(k, 0) + v
 
-    actual_conns = len(pool)
-    if actual_conns == 0:
-        err("Could not open any connections — aborting load test")
+    actual = len(pool)
+    if actual == 0:
+        err("  No connections available — skipping this node")
         return result
-    if actual_conns < workers:
-        warn(f"Only {actual_conns} connections available — reducing workers to match")
-        workers = actual_conns
+    if actual < workers:
+        warn(f"  Only {actual} connections — reducing workers")
+        workers = actual
 
-    ok(f"Pool ready: {C.BOLD}{actual_conns}{C.RESET} live connections")
-    result.max_connections = actual_conns
-    for k, v in pool_errors.items():
-        result.errors[k] = result.errors.get(k, 0) + v
+    ok(f"  Pool ready: {C.BOLD}{actual}{C.RESET} live connections")
+    result.max_connections = actual
 
-    # ── Phase 2: run workers ──────────────────────────────────
-    rq: queue.Queue = queue.Queue()
-    key_prefix = f"lt:{int(time.time())}"
-
-    # Pre-populate keys on master so replica GET has data to read
-    if is_replica:
-        info("Replica mode: skipping SET pre-population (data must exist on master)")
-
-    threads = []
-    t_start = time.perf_counter()
+    rq         = queue.Queue()
+    key_prefix = f"lt:{node.port}:{int(time.time())}"
+    threads    = []
+    t_start    = time.perf_counter()
 
     for wid in range(workers):
-        client = pool[wid % actual_conns]
+        client = pool[wid % actual]
         t = threading.Thread(
-            target=run_worker,
-            args=(wid, client, ops_per_worker, key_prefix, rq, is_replica),
+            target=_worker,
+            args=(wid, client, ops_per_worker, key_prefix, rq, node.is_replica),
             daemon=True,
         )
         threads.append(t)
@@ -421,12 +448,12 @@ def test_load(host, port, password, use_ssl, is_cluster,
     done_evt = threading.Event()
     def progress():
         sp = "⣾⣽⣻⢿⡿⣟⣯⣷"
-        i = 0
+        i  = 0
         while not done_evt.is_set():
             elapsed = time.perf_counter() - t_start
-            alive = sum(1 for t in threads if t.is_alive())
+            alive   = sum(1 for t in threads if t.is_alive())
             print(f"\r  {sp[i%len(sp)]} Threads: {alive}/{workers}  "
-                  f"Live conns: {C.GREEN}{actual_conns}{C.RESET}  "
+                  f"Conns: {C.GREEN}{actual}{C.RESET}  "
                   f"Elapsed: {elapsed:.1f}s   ", end="", flush=True)
             i += 1
             time.sleep(0.1)
@@ -440,22 +467,15 @@ def test_load(host, port, password, use_ssl, is_cluster,
     result.duration_sec = time.perf_counter() - t_start
     print()
 
-    # ── Phase 3: close pool only if we opened it ─────────────
     if owned_pool:
-        info(f"Closing {actual_conns} pooled connections…")
         for c in pool:
-            try:
-                c.close()
-            except Exception:
-                pass
-        ok("Pool closed")
-    else:
-        info(f"Leaving {actual_conns} connections open (owned by Step 2)")
+            try: c.close()
+            except Exception: pass
 
     while not rq.empty():
         s, f, lats, errs = rq.get()
-        result.success += s
-        result.failed += f
+        result.success         += s
+        result.failed          += f
         result.latencies_ms.extend(lats)
         for k, v in errs.items():
             result.errors[k] = result.errors.get(k, 0) + v
@@ -463,104 +483,175 @@ def test_load(host, port, password, use_ssl, is_cluster,
     return result
 
 
+def step_load(nodes: List[NodeInfo], password, use_ssl, is_cluster,
+              workers: int, ops_per_worker: int, min_conns: int,
+              conn_results: dict) -> List[TestResult]:
+    bold("\n══════════════════════════════════════════")
+    bold(" STEP 3: Load test  (per node)")
+    bold("══════════════════════════════════════════")
+
+    results = []
+    for node in nodes:
+        if not node.reachable:
+            continue
+        reuse = getattr(conn_results.get(node.addr), "_pool", None)
+        r = load_test_node(node, password, use_ssl, is_cluster,
+                           workers, ops_per_worker, min_conns, reuse)
+        results.append(r)
+
+        # Close the step-2 pool after load test is done for this node
+        if reuse:
+            for c in reuse:
+                try: c.close()
+                except Exception: pass
+            info(f"  Step 2 pool closed for {node.addr}")
+
+    return results
+
+
 # ─────────────────────────────────────────────────────────────
-# STEP 4: Pipeline test (standalone only)
+# STEP 4: Pipeline test  (master only — replicas are read-only)
 # ─────────────────────────────────────────────────────────────
-def test_pipeline(host, port, password, use_ssl, is_cluster,
-                  pipeline_size, iterations, is_replica: bool = False) -> TestResult:
+def step_pipeline(nodes: List[NodeInfo], password, use_ssl, is_cluster,
+                  pipeline_size: int, iterations: int) -> List[TestResult]:
     bold("\n══════════════════════════════════════════")
     bold(" STEP 4: Pipeline test")
     bold("══════════════════════════════════════════")
-    result = TestResult("pipeline")
 
     if is_cluster:
-        warn("Pipeline in cluster mode is limited to a single shard — skipping")
-        return result
+        warn("Pipeline skipped in cluster mode (single-shard limitation)")
+        return []
 
-    if is_replica:
-        info(f"Batch size: {pipeline_size}  |  Iterations: {iterations}  |  GET-only (replica)")
-    else:
-        info(f"Batch size: {pipeline_size}  |  Iterations: {iterations}  |  SET")
+    results = []
+    for node in nodes:
+        if not node.reachable:
+            continue
 
-    try:
-        client = create_client(host, port, password, use_ssl, is_cluster)
+        info(f"\n  Node: {node.label}  batch={pipeline_size}  iters={iterations}")
+        result = TestResult("pipeline", node=node.addr)
 
-        # Pre-populate keys so GET pipeline has data (replica or not)
-        if not is_replica:
-            prep = client.pipeline(transaction=False)
-            for j in range(pipeline_size):
-                prep.set(f"pipe:prep:{j}", f"v{j}", ex=600)
-            prep.execute()
+        if node.is_replica:
+            # GET pipeline on replica
+            op_label = "GET-only (replica)"
+        else:
+            op_label = "SET"
+        info(f"  Operations: {op_label}")
 
-        t_start = time.perf_counter()
-        for i in range(iterations):
-            pipe = client.pipeline(transaction=False)
-            for j in range(pipeline_size):
-                if is_replica:
-                    pipe.get(f"pipe:prep:{j}")
-                else:
-                    pipe.set(f"pipe:{i}:{j}", f"v{j}", ex=60)
-            t0 = time.perf_counter()
-            try:
-                pipe.execute()
-                result.latencies_ms.append((time.perf_counter() - t0) * 1000)
-                result.success += pipeline_size
-            except Exception as e:
-                result.failed += pipeline_size
-                n = type(e).__name__
-                result.errors[n] = result.errors.get(n, 0) + 1
-        result.duration_sec = time.perf_counter() - t_start
-        result.total_ops = result.success + result.failed
-        client.close()
-        ok(f"Done: {result.total_ops} ops in {result.duration_sec:.2f}s")
-    except Exception as e:
-        err(f"{type(e).__name__}: {e}")
-    return result
+        try:
+            client = make_client(node.host, node.port, password, use_ssl, is_cluster)
+
+            # Pre-populate keys for GET pipeline on replica
+            if not node.is_replica:
+                prep = client.pipeline(transaction=False)
+                for j in range(pipeline_size):
+                    prep.set(f"pipe:prep:{j}", f"v{j}", ex=600)
+                prep.execute()
+            else:
+                info("  Replica: using existing keys from master for GET pipeline")
+
+            t_start = time.perf_counter()
+            for i in range(iterations):
+                pipe = client.pipeline(transaction=False)
+                for j in range(pipeline_size):
+                    if node.is_replica:
+                        pipe.get(f"pipe:prep:{j}")
+                    else:
+                        pipe.set(f"pipe:{i}:{j}", f"v{j}", ex=60)
+                t0 = time.perf_counter()
+                try:
+                    pipe.execute()
+                    result.latencies_ms.append((time.perf_counter() - t0) * 1000)
+                    result.success += pipeline_size
+                except Exception as e:
+                    result.failed += pipeline_size
+                    n = type(e).__name__
+                    result.errors[n] = result.errors.get(n, 0) + 1
+
+            result.duration_sec = time.perf_counter() - t_start
+            result.total_ops    = result.success + result.failed
+            client.close()
+            ok(f"  Done: {result.total_ops} ops in {result.duration_sec:.2f}s  "
+               f"({result.ops_per_sec:.0f} ops/sec)")
+        except Exception as e:
+            err(f"  {type(e).__name__}: {e}")
+
+        results.append(result)
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────
 # Report
 # ─────────────────────────────────────────────────────────────
-def print_report(results: list):
+def _print_result(r: TestResult):
+    if r.test_name == "max_connections":
+        ok(f"Max simultaneous connections: {C.BOLD}{r.max_connections}{C.RESET}")
+        if r.errors:
+            warn("  Failure reasons:")
+            for n, cnt in r.errors.items():
+                print(f"    {C.RED}{n}{C.RESET}: {cnt}")
+    elif r.total_ops == 0:
+        warn("  Test skipped or 0 operations")
+    else:
+        rows = [
+            ["Total ops",          r.total_ops],
+            ["Successful",         r.success],
+            ["Failed",             r.failed],
+            ["Success rate",       f"{r.success_rate:.2f}%"],
+            ["Duration",           f"{r.duration_sec:.2f} s"],
+            ["Ops/sec",            f"{r.ops_per_sec:.0f}"],
+            ["Active connections", r.max_connections],
+            ["Avg latency",        f"{r.avg_latency:.2f} ms"],
+            ["P50",                f"{r.p50:.2f} ms"],
+            ["P95",                f"{r.p95:.2f} ms"],
+            ["P99",                f"{r.p99:.2f} ms"],
+            ["Max latency",        f"{r.max_latency:.2f} ms"],
+        ]
+        if HAS_TABULATE:
+            print(tabulate(rows, headers=["Metric", "Value"],
+                           tablefmt="rounded_outline"))
+        else:
+            for name, val in rows:
+                print(f"  {name:<22} {val}")
+        if r.errors:
+            warn("  Errors:")
+            for n, cnt in r.errors.items():
+                print(f"    {C.RED}{n}{C.RESET}: {cnt}")
+
+
+def print_report(nodes: List[NodeInfo],
+                 conn_res: dict,
+                 load_res: List[TestResult],
+                 pipe_res: List[TestResult]):
     bold("\n╔══════════════════════════════════════════╗")
     bold("║              SUMMARY REPORT              ║")
-    bold("╚══════════════════════════════════════════╝\n")
+    bold("╚══════════════════════════════════════════╝")
 
-    for r in results:
-        bold(f"── {r.test_name.upper()} ──")
-        if r.test_name == "max_connections":
-            ok(f"Max simultaneous connections: {C.BOLD}{r.max_connections}{C.RESET}")
-            if r.errors:
-                warn("Failure reasons:")
-                for n, cnt in r.errors.items():
-                    print(f"    {C.RED}{n}{C.RESET}: {cnt}")
-        elif r.total_ops == 0:
-            warn("Test skipped or 0 operations")
-        else:
-            rows = [
-                ["Total ops",          r.total_ops],
-                ["Successful",         r.success],
-                ["Failed",             r.failed],
-                ["Success rate",       f"{r.success_rate:.2f}%"],
-                ["Duration",           f"{r.duration_sec:.2f} s"],
-                ["Ops/sec",            f"{r.ops_per_sec:.0f}"],
-                ["Active connections", r.max_connections],
-                ["Avg latency",        f"{r.avg_latency:.2f} ms"],
-                ["P50",                f"{r.p50:.2f} ms"],
-                ["P95",                f"{r.p95:.2f} ms"],
-                ["P99",                f"{r.p99:.2f} ms"],
-                ["Max latency",        f"{r.max_latency:.2f} ms"],
-            ]
-            if HAS_TABULATE:
-                print(tabulate(rows, headers=["Metric", "Value"],
-                               tablefmt="rounded_outline"))
-            else:
-                for name, val in rows:
-                    print(f"  {name:<22} {val}")
-            if r.errors:
-                warn("Errors:")
-                for n, cnt in r.errors.items():
-                    print(f"    {C.RED}{n}{C.RESET}: {cnt}")
+    # Index results by node addr
+    load_by_node = {r.node: r for r in load_res}
+    pipe_by_node = {r.node: r for r in pipe_res}
+
+    for node in nodes:
+        if not node.reachable:
+            continue
+        role_str = ("MASTER"  if node.role == "master"
+               else "REPLICA" if node.role == "slave"
+               else "UNKNOWN")
+        head(f"\n┌─ {node.addr}  [{role_str}]  redis={node.redis_version}"
+             f"  mem={node.memory_mb}MB")
+
+        if node.addr in conn_res:
+            bold("│  ── MAX CONNECTIONS ──")
+            _print_result(conn_res[node.addr])
+
+        if node.addr in load_by_node:
+            bold("│  ── LOAD TEST ──")
+            _print_result(load_by_node[node.addr])
+
+        if node.addr in pipe_by_node:
+            bold("│  ── PIPELINE ──")
+            _print_result(pipe_by_node[node.addr])
+
         print()
 
 
@@ -569,109 +660,119 @@ def print_report(results: list):
 # ─────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Redis Stress Test (auto-detect cluster/standalone)",
+        description="Redis Stress Tester — standalone, replication, or cluster",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="""
+Examples:
+  # Single node
+  python redis_cluster_test.py --hosts 127.0.0.1:6379 --password secret
+
+  # Replication set (1 master + 2 replicas)
+  python redis_cluster_test.py \\
+    --hosts "redis.gm3.local:32570,redis.gm3.local:32571,redis.gm3.local:32572" \\
+    --password secret
+
+  # Redis Cluster
+  python redis_cluster_test.py --hosts redis.example.com:6379 --password secret --cluster
+""",
     )
-    p.add_argument("--host",       default="127.0.0.1", help="Redis host")
-    p.add_argument("--port",       type=int, default=6379, help="Redis port")
+    # Connection
+    p.add_argument("--hosts",      default="127.0.0.1:6379",
+                   help="Comma-separated list of host:port  (e.g. h1:6379,h2:6380,h3:6381)")
     p.add_argument("--password",   default="", help="AUTH password")
     p.add_argument("--ssl",        action="store_true", help="Enable TLS/SSL")
-    p.add_argument("--cluster",    action="store_true",
-                   help="Force cluster mode (default: auto-detect)")
-    p.add_argument("--no-cluster", action="store_true",
-                   help="Force standalone mode (overrides auto-detect)")
+    p.add_argument("--cluster",    action="store_true", help="Force Redis Cluster mode")
+    p.add_argument("--no-cluster", action="store_true", help="Force standalone mode")
 
-    p.add_argument("--max-conn",      type=int, default=10000, help="Max connections to test")
+    # Step 2
+    p.add_argument("--max-conn",      type=int, default=10000, help="Max connections per node")
     p.add_argument("--conn-step",     type=int, default=50,    help="Connection open batch size")
-    p.add_argument("--workers",       type=int, default=100,   help="Parallel worker threads")
+
+    # Step 3
+    p.add_argument("--workers",       type=int, default=100,   help="Parallel workers per node")
     p.add_argument("--ops",           type=int, default=500,   help="Ops per worker")
-    p.add_argument("--min-conns",     type=int, default=1000,  help="Min persistent connections during load test")
+    p.add_argument("--min-conns",     type=int, default=1000,  help="Min live connections during load test")
+
+    # Step 4
     p.add_argument("--pipeline-size", type=int, default=100,   help="Pipeline batch size")
     p.add_argument("--pipeline-iter", type=int, default=100,   help="Pipeline iterations")
 
-    p.add_argument("--skip-conn",     action="store_true", help="Skip connection test")
-    p.add_argument("--skip-load",     action="store_true", help="Skip load test")
-    p.add_argument("--skip-pipeline", action="store_true", help="Skip pipeline test")
+    # Skip
+    p.add_argument("--skip-conn",     action="store_true", help="Skip Step 2")
+    p.add_argument("--skip-load",     action="store_true", help="Skip Step 3")
+    p.add_argument("--skip-pipeline", action="store_true", help="Skip Step 4")
     return p.parse_args()
 
 
+# ─────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────
 def main():
-    args = parse_args()
+    args     = parse_args()
     password = args.password or None
 
     bold("\n╔══════════════════════════════════════════╗")
     bold("║       Redis Cluster Stress Tester        ║")
     bold("╚══════════════════════════════════════════╝")
     info(f"redis-py version : {redis.__version__}")
-    info(f"Host             : {args.host}:{args.port}")
+    info(f"Hosts            : {args.hosts}")
     info(f"SSL              : {'yes' if args.ssl else 'no'}")
     info(f"Password         : {'*** (set)' if password else 'not set'}")
 
-    # Mode detection
+    nodes_raw  = parse_hosts(args.hosts)
+    is_cluster = args.cluster and not args.no_cluster
+
     if args.no_cluster:
-        is_cluster = False
         info("Mode : Standalone (forced)")
     elif args.cluster:
-        is_cluster = True
         info("Mode : Cluster (forced)")
     else:
-        info("Mode : detecting automatically…")
-        detected = detect_mode(args.host, args.port, password, args.ssl)
-        is_cluster = (detected == "cluster")
-        ok(f"Mode : {detected.capitalize()} (auto-detected)")
+        info("Mode : Standalone / Replication (auto)")
 
-    connected, is_replica = test_connectivity(
-        args.host, args.port, password, args.ssl, is_cluster)
-    if not connected:
-        err("Check your connection parameters and try again.")
+    # ── STEP 1 ─────────────────────────────────────────────────
+    nodes = step_connectivity(nodes_raw, password, args.ssl, is_cluster)
+
+    reachable = [n for n in nodes if n.reachable]
+    masters   = [n for n in reachable if n.role == "master"]
+    replicas  = [n for n in reachable if n.is_replica]
+
+    if not reachable:
+        err("No reachable nodes. Exiting.")
         sys.exit(1)
 
-    results = []
-    conn_pool = None  # connections kept alive from step 2 → reused in step 3
+    if masters:
+        ok(f"Master node(s)  : {', '.join(n.addr for n in masters)}")
+    if replicas:
+        info(f"Replica node(s) : {', '.join(n.addr for n in replicas)}")
+        info("Replicas will use GET-only operations (read-only nodes)")
 
+    # ── STEP 2 ─────────────────────────────────────────────────
+    conn_results = {}
     if not args.skip_conn:
-        r = test_max_connections(
-            args.host, args.port, password, args.ssl, is_cluster,
+        conn_results = step_max_connections(
+            reachable, password, args.ssl, is_cluster,
             args.max_conn, args.conn_step,
         )
-        results.append(r)
-        conn_pool = getattr(r, "_pool", None)  # grab the open pool
 
+    # ── STEP 3 ─────────────────────────────────────────────────
+    load_results = []
     if not args.skip_load:
-        r = test_load(
-            args.host, args.port, password, args.ssl, is_cluster,
+        load_results = step_load(
+            reachable, password, args.ssl, is_cluster,
             args.workers, args.ops, args.min_conns,
-            reuse_pool=conn_pool,
-            is_replica=is_replica,
+            conn_results,
         )
-        results.append(r)
-        # Now safe to close step-2 pool
-        if conn_pool:
-            info(f"Closing Step 2 pool ({len(conn_pool)} connections)…")
-            for c in conn_pool:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            ok("Step 2 pool closed")
-            conn_pool = None
 
-    # If step 2 was skipped, close pool if still open
-    if conn_pool:
-        for c in conn_pool:
-            try:
-                c.close()
-            except Exception:
-                pass
-
+    # ── STEP 4 ─────────────────────────────────────────────────
+    pipe_results = []
     if not args.skip_pipeline:
-        results.append(test_pipeline(
-            args.host, args.port, password, args.ssl, is_cluster,
+        pipe_results = step_pipeline(
+            reachable, password, args.ssl, is_cluster,
             args.pipeline_size, args.pipeline_iter,
-            is_replica=is_replica,
-        ))
+        )
 
-    print_report(results)
+    # ── Report ─────────────────────────────────────────────────
+    print_report(nodes, conn_results, load_results, pipe_results)
 
 
 if __name__ == "__main__":
